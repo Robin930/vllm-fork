@@ -2,6 +2,7 @@
 """Sequence and its related classes."""
 import copy
 import enum
+import time
 from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
@@ -9,7 +10,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, List
 
 import msgspec
 import torch
@@ -93,6 +94,132 @@ class SequenceStage(enum.Enum):
     PREFILL = enum.auto()
     DECODE = enum.auto()
 
+
+class RequestLevelMetrics:
+    def __init__(
+        self,
+        id: str,
+        arrived_at: float,
+        num_prompt_tokens: int,
+    ):
+        self._id = id
+        self._arrived_at: float = arrived_at
+        self._num_prompt_tokens: int = num_prompt_tokens
+        self._num_output_tokens: int = 0
+        self._is_scheduled: bool = False
+        self._is_completed: bool = False
+        self._scheduled_at: Optional[float] = None
+        self._completed_at: Optional[float] = None
+        self._prompt_processing_completed_at: Optional[float] = None
+        self._execution_time: float = 0.0
+        self._preempted_time: float = 0.0
+        self._last_token_generated_at: Optional[float] = None
+        self._last_token_generation_time: float = 0.0
+        self._tbt: List[float] = []
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    @property
+    def num_prompt_tokens(self) -> int:
+        return self._num_prompt_tokens
+
+    @property
+    def num_output_tokens(self) -> int:
+        return self._num_output_tokens
+
+    @property
+    def num_total_tokens(self) -> int:
+        return self._num_prompt_tokens + self._num_output_tokens
+
+    @property
+    def is_scheduled(self) -> bool:
+        return self._is_scheduled
+
+    @property
+    def is_completed(self) -> bool:
+        return self._is_completed
+    
+    @property
+    def arrived_at(self) -> float:
+        return self._arrived_at
+
+    @property
+    def scheduled_at(self) -> Optional[float]:
+        return self._scheduled_at
+
+    @property
+    def completed_at(self) -> Optional[float]:
+        return self._completed_at
+
+    @property
+    def prompt_processing_completed_at(self) -> Optional[float]:
+        return self._prompt_processing_completed_at
+    
+    @property
+    def e2e_time(self) -> Optional[float]:
+        return (
+            self._completed_at - self._arrived_at
+            if self._completed_at is not None
+            else None
+        )
+
+    @property
+    def e2e_time_normalized(self) -> float:
+        return self.e2e_time / self._num_output_tokens
+
+    @property
+    def e2e_prefill_time(self) -> Optional[float]:
+        return (
+            self._prompt_processing_completed_at - self._arrived_at
+            if self._prompt_processing_completed_at is not None
+            else None
+        )
+
+    @property
+    def e2e_prefill_time_normalized(self) -> Optional[float]:
+        return (
+            (self.e2e_prefill_time / self._num_prompt_tokens)
+            if self._prompt_processing_completed_at is not None
+            else None
+        )
+
+    @property
+    def execution_time(self) -> float:
+        return self._execution_time
+
+    @property
+    def execution_time_normalized(self) -> float:
+        return self.execution_time / self._num_output_tokens
+    
+    @property
+    def preempted_time(self) -> float:
+        return self._preempted_time
+
+    @property
+    def last_token_generation_time(self) -> float:
+        return self._last_token_generated_at
+
+    def on_token_generated(self) -> None:
+        current = time.time()
+        # TODO: chentong multiple step
+        self._num_output_tokens += 1
+
+        if not self._last_token_generated_at:
+            # prefill
+            self._last_token_generation_time = 0
+        else:
+            # decode
+            self._last_token_generation_time = (
+                current - self._last_token_generated_at
+            )
+            self._tbt.append(self._last_token_generation_time)
+            # print(f'{self._num_output_tokens}th token tbt: {self._last_token_generation_time}')
+
+        self._last_token_generated_at = current
+
+    
 
 @dataclass
 class RequestMetrics:
@@ -693,6 +820,11 @@ class SequenceGroup:
         self.priority = priority
 
         self.cached_request_output = None
+        self.request_level_metrics = RequestLevelMetrics(
+            request_id,
+            arrival_time,
+            len(seqs[0].prompt_token_ids)
+        )
 
     @property
     def prompt(self) -> Optional[str]:

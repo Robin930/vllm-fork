@@ -9,6 +9,7 @@ import vllm.envs as envs
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 
+from vllm.profiler.cuda_timer import CudaTimer
 
 def is_rocm_aiter_rmsnorm_enabled() -> bool:
     return current_platform.is_rocm() \
@@ -92,6 +93,7 @@ class RMSNorm(CustomOp):
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
         has_weight: bool = True,
+        norm_name: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -104,6 +106,7 @@ class RMSNorm(CustomOp):
         self.weight = torch.ones(hidden_size)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
+        self._norm_timer = CudaTimer(norm_name)
 
     def forward_native(
         self,
@@ -148,17 +151,18 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.variance_size_override is not None:
-            return self.forward_native(x, residual)
+        with self._norm_timer:
+            if self.variance_size_override is not None:
+                return self.forward_native(x, residual)
 
-        add_residual = residual is not None
-        norm_func = dispatch_cuda_rmsnorm_func(add_residual)
+            add_residual = residual is not None
+            norm_func = dispatch_cuda_rmsnorm_func(add_residual)
 
-        if add_residual:
-            return norm_func(x, residual, self.weight.data,
-                             self.variance_epsilon)
-        else:
-            return norm_func(x, self.weight.data, self.variance_epsilon)
+            if add_residual:
+                return norm_func(x, residual, self.weight.data,
+                                self.variance_epsilon)
+            else:
+                return norm_func(x, self.weight.data, self.variance_epsilon)
 
     def forward_hpu(
         self,

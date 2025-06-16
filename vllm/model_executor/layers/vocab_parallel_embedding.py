@@ -16,6 +16,9 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+from vllm.profiler.cuda_timer import CudaTimer
+from vllm.profiler.metrics.constants import OperationMetrics
+
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 
@@ -202,12 +205,17 @@ class VocabParallelEmbedding(torch.nn.Module):
                  org_num_embeddings: Optional[int] = None,
                  padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 linear_metric_name: Optional[str] = None,
+                 communication_metric_name: Optional[str] = None,
+                 mocked_tp_size: Optional[int] = None):
         super().__init__()
 
         # Keep the input dimensions.
         tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        if mocked_tp_size is not None:
+            self.tp_size = mocked_tp_size
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -267,6 +275,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                                          self.num_embeddings_padded,
                                          params_dtype=params_dtype,
                                          weight_loader=self.weight_loader)
+        # self._linear_timer = CudaTimer(linear_metric_name)
+        # self._communication_timer = CudaTimer(communication_metric_name)
+        self._emb_timer = CudaTimer(OperationMetrics.EMB)
 
     @classmethod
     def _get_indices(cls, vocab_size_padded: int, org_vocab_size_padded: int,
@@ -401,25 +412,26 @@ class VocabParallelEmbedding(torch.nn.Module):
             param[loaded_weight.shape[0]:].data.fill_(0)
 
     def forward(self, input_):
-        if self.tp_size > 1:
-            # Build the mask.
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_, self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index)
-        else:
-            masked_input = input_
-        # Get the embeddings.
-        output_parallel = self.quant_method.embedding(self,
-                                                      masked_input.long())
-        # Mask the output embedding.
-        if self.tp_size > 1:
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        return output
+        with self._emb_timer:
+            if self.tp_size > 1:
+                # Build the mask.
+                masked_input, input_mask = get_masked_input_and_mask(
+                    input_, self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                    self.shard_indices.num_org_vocab_padding,
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index)
+            else:
+                masked_input = input_
+            # Get the embeddings.
+            output_parallel = self.quant_method.embedding(self,
+                                                            masked_input.long())
+            # Mask the output embedding.
+            if self.tp_size > 1:
+                output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            # Reduce across all the model parallel GPUs.
+            output = tensor_model_parallel_all_reduce(output_parallel)
+            return output
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

@@ -27,6 +27,8 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm.profiler.cuda_timer import CudaTimer
+
 logger = init_logger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -175,7 +177,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-        weight = Parameter(torch.empty(sum(output_partition_sizes),
+        weight = Parameter(torch.rand(sum(output_partition_sizes),
                                        input_size_per_partition,
                                        dtype=params_dtype),
                            requires_grad=False)
@@ -368,9 +370,14 @@ class ColumnParallelLinear(LinearBase):
         prefix: str = "",
         *,
         return_bias: bool = True,
+        linear_metric_name: Optional[str] = None,
+        communication_metric_name: Optional[str] = None,
+        mocked_tp_size: Optional[int] = None,
     ):
         # Divide the weight matrix along the last dimension.
         self.tp_size = get_tensor_model_parallel_world_size()
+        if mocked_tp_size is not None:
+            self.tp_size = mocked_tp_size
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -415,6 +422,9 @@ class ColumnParallelLinear(LinearBase):
             })
         else:
             self.register_parameter("bias", None)
+
+        self._linear_timer = CudaTimer(linear_metric_name)
+        self._communication_timer = CudaTimer(communication_metric_name)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
@@ -467,14 +477,19 @@ class ColumnParallelLinear(LinearBase):
     def forward(
         self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+        # print(f'qkv, input_shape: {input_.shape}, input_dtype: {input_.dtype}, weight_shape: {self.weight.shape}, weight_dtype: {self.weight.dtype}')
         bias = self.bias if not self.skip_bias_add else None
+        # if bias is not None:
+        #     print(f'qkv bias_shape:{bias.shape} bias_dtype:{bias.dtype}')
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        with self._linear_timer:
+            output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(output_parallel)
+            with self._communication_timer:
+                output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -526,9 +541,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         *,
         return_bias: bool = True,
+        linear_metric_name: Optional[str] = None,
+        communication_metric_name: Optional[str] = None,
+        mocked_tp_size: Optional[int] = None,
     ):
         self.output_sizes = output_sizes
         tp_size = get_tensor_model_parallel_world_size()
+        if mocked_tp_size is not None:
+            tp_size = mocked_tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(input_size=input_size,
                          output_size=sum(output_sizes),
@@ -538,7 +558,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          params_dtype=params_dtype,
                          quant_config=quant_config,
                          prefix=prefix,
-                         return_bias=return_bias)
+                         return_bias=return_bias,
+                         linear_metric_name=linear_metric_name,
+                         communication_metric_name=communication_metric_name,
+                         mocked_tp_size=mocked_tp_size)
 
     def weight_loader(self,
                       param: Parameter,
@@ -804,6 +827,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         *,
         return_bias: bool = True,
+        linear_metric_name: Optional[str] = None,
+        communication_metric_name: Optional[str] = None,
+        mocked_tp_size: Optional[int] = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -813,6 +839,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size()
+        if mocked_tp_size is not None:
+            tp_size = mocked_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
@@ -838,7 +866,10 @@ class QKVParallelLinear(ColumnParallelLinear):
                          params_dtype=params_dtype,
                          quant_config=quant_config,
                          prefix=prefix,
-                         return_bias=return_bias)
+                         return_bias=return_bias,
+                         linear_metric_name=linear_metric_name,
+                         communication_metric_name=communication_metric_name,
+                         mocked_tp_size=mocked_tp_size)
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
@@ -1146,10 +1177,15 @@ class RowParallelLinear(LinearBase):
         prefix: str = "",
         *,
         return_bias: bool = True,
+        linear_metric_name: Optional[str] = None,
+        communication_metric_name: Optional[str] = None,
+        mocked_tp_size: Optional[int] = None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        if mocked_tp_size is not None:
+            self.tp_size = mocked_tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1189,6 +1225,9 @@ class RowParallelLinear(LinearBase):
             })
         else:
             self.register_parameter("bias", None)
+
+        self._linear_timer = CudaTimer(linear_metric_name)
+        self._communication_timer = CudaTimer(communication_metric_name)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
@@ -1255,11 +1294,13 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self,
-                                                  input_parallel,
-                                                  bias=bias_)
+        with self._linear_timer:
+            output_parallel = self.quant_method.apply(self,
+                                                    input_parallel,
+                                                    bias=bias_)
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            with self._communication_timer:
+                output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 

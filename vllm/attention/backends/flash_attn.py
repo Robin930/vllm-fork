@@ -618,6 +618,12 @@ class FlashAttentionImpl(AttentionImpl):
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
     ) -> None:
+        # print('FlashAttentionImpl init')
+        # print(f'num_heads: {num_heads}, head_size: {head_size}, scale: {scale}')
+        # print(f'num_kv_heads: {num_kv_heads}, alibi_slopes: {alibi_slopes}')
+        # print(f'sliding_window: {sliding_window}, kv_cache_dtype: {kv_cache_dtype}')
+        # print(f'blocksparse_params: {blocksparse_params}, logits_soft_cap: {logits_soft_cap}')
+        # print(f'attn_type: {attn_type}')
         if blocksparse_params is not None:
             raise ValueError(
                 "FlashAttention does not support block-sparse attention.")
@@ -665,6 +671,14 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # print('flash-attention')
+        # print(f'query shape: {query.shape}, dtype: {query.dtype}')
+        # print(f'key shape: {key.shape}, dtype: {key.dtype}')
+        # print(f'value shape: {value.shape}, dtype: {value.dtype}')
+        # print(f'kv_cache shape: {kv_cache.shape}, dtype: {kv_cache.dtype}')
+        # print(f'attn_metadata: {attn_metadata}')
+        # if output is not None:
+        #     print(f'output shape: {output.shape}, dtype: {output.dtype}')
         """Forward pass with FlashAttention.
 
         Args:
@@ -735,6 +749,8 @@ class FlashAttentionImpl(AttentionImpl):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 # profiling run.
+                # print(f'k_scale: dtype {layer._k_scale.dtype}')
+                # print(f'v_scale: dtype {layer._v_scale.dtype}')
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
                     key,
                     value,

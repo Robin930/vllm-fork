@@ -19,6 +19,8 @@ from vllm.sequence import ExecuteModelRequest, PoolerOutput
 from vllm.utils import make_async
 from vllm.worker.worker_base import WorkerBase
 
+from vllm.profiler.metrics.metrics_store import MetricsStore
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -51,6 +53,8 @@ class ExecutorBase(ABC):
         self.observability_config = vllm_config.observability_config
         self._init_executor()
         self.is_sleeping = False
+
+        self.metrics_store = MetricsStore.get_instance()
 
     @abstractmethod
     def _init_executor(self) -> None:
@@ -196,6 +200,14 @@ class ExecutorBase(ABC):
 
     def stop_profile(self) -> None:
         self.collective_rpc("stop_profile")
+
+    def dump_metrics_store(self) -> None:
+        self.collective_rpc("dump_metrics_store")
+
+    def reset_metrics_store(self) -> None:
+        self.metrics_store.reset()
+        self.collective_rpc("reset_metrics_store")
+        
 
     def sleep(self, level: int = 1):
         if self.is_sleeping:

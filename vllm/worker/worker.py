@@ -32,6 +32,10 @@ from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
 
+from vllm.profiler.metrics.metrics_store import MetricsStore
+from vllm.profiler.metrics.constants import CpuOperationMetrics
+from vllm.profiler.cpu_timer import CPUTimer
+
 logger = init_logger(__name__)
 
 
@@ -53,6 +57,9 @@ class Worker(LocalOrDistributedWorkerBase):
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
     ) -> None:
         WorkerBase.__init__(self, vllm_config)
+        self.metrics_store = MetricsStore.get_or_create_instance(rank, vllm_config, False)       # local metrics store, store operation level metrics
+        self._prepare_input_timer = CPUTimer(CpuOperationMetrics.PREPARE_INPUTS_E2E)
+        self._prepare_worker_input_timer = CPUTimer(CpuOperationMetrics.PREPARE_WORKER_INPUT)
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
@@ -112,6 +119,8 @@ class Worker(LocalOrDistributedWorkerBase):
         else:
             self.profiler = None
 
+        
+
     def start_profile(self):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
@@ -121,6 +130,12 @@ class Worker(LocalOrDistributedWorkerBase):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
+
+    def dump_metrics_store(self) -> None:
+        self.metrics_store.dump(False)
+
+    def reset_metrics_store(self) -> None:
+        self.metrics_store.reset()
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -351,32 +366,36 @@ class Worker(LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
-        virtual_engine = execute_model_req.virtual_engine
-        num_steps = execute_model_req.num_steps
-        num_seq_groups = len(execute_model_req.seq_group_metadata_list)
-        # `blocks_to_swap_in` and `blocks_to_swap_out` are cpu tensors.
-        # they contain parameters to launch cudamemcpyasync.
-        blocks_to_swap_in = torch.tensor(execute_model_req.blocks_to_swap_in,
-                                         device="cpu",
-                                         dtype=torch.int64).view(-1, 2)
-        blocks_to_swap_out = torch.tensor(execute_model_req.blocks_to_swap_out,
-                                          device="cpu",
-                                          dtype=torch.int64).view(-1, 2)
-        # `blocks_to_copy` is a gpu tensor. The src and tgt of
-        # blocks to copy are in the same device, and `blocks_to_copy`
-        # can be used directly within cuda kernels.
-        blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
-                                      device=self.device,
-                                      dtype=torch.int64).view(-1, 2)
+        with self._prepare_worker_input_timer:
+            virtual_engine = execute_model_req.virtual_engine
+            num_steps = execute_model_req.num_steps
+            num_seq_groups = len(execute_model_req.seq_group_metadata_list)
+            # `blocks_to_swap_in` and `blocks_to_swap_out` are cpu tensors.
+            # they contain parameters to launch cudamemcpyasync.
+            # print(f'blocks_to_swap_in: {execute_model_req.blocks_to_swap_in}')
+            # print(f'blocks_to_swap_out: {execute_model_req.blocks_to_swap_out}')
+            # print(f'blocks_to_copy: {execute_model_req.blocks_to_copy}')
+            blocks_to_swap_in = torch.tensor(execute_model_req.blocks_to_swap_in,
+                                            device="cpu",
+                                            dtype=torch.int64).view(-1, 2)
+            blocks_to_swap_out = torch.tensor(execute_model_req.blocks_to_swap_out,
+                                            device="cpu",
+                                            dtype=torch.int64).view(-1, 2)
+            # `blocks_to_copy` is a gpu tensor. The src and tgt of
+            # blocks to copy are in the same device, and `blocks_to_copy`
+            # can be used directly within cuda kernels.
+            blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
+                                        device=self.device,
+                                        dtype=torch.int64).view(-1, 2)
 
-        return WorkerInput(
-            num_seq_groups=num_seq_groups,
-            blocks_to_swap_in=blocks_to_swap_in,
-            blocks_to_swap_out=blocks_to_swap_out,
-            blocks_to_copy=blocks_to_copy,
-            virtual_engine=virtual_engine,
-            num_steps=num_steps,
-        )
+            return WorkerInput(
+                num_seq_groups=num_seq_groups,
+                blocks_to_swap_in=blocks_to_swap_in,
+                blocks_to_swap_out=blocks_to_swap_out,
+                blocks_to_copy=blocks_to_copy,
+                virtual_engine=virtual_engine,
+                num_steps=num_steps,
+            )
 
     @torch.inference_mode()
     def execute_worker(self, worker_input: WorkerInput) -> None:

@@ -24,6 +24,7 @@ from vllm.utils import (enable_trace_function_call_for_thread,
 from vllm.worker.model_runner_base import (BroadcastableModelInput,
                                            ModelRunnerBase,
                                            ModelRunnerInputBase)
+from vllm.profiler.cpu_timer import CPUTimer
 
 logger = init_logger(__name__)
 
@@ -268,6 +269,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
     is_driver_worker: bool
     model_runner: ModelRunnerBase
     observability_config: Optional[ObservabilityConfig] = None
+    _prepare_input_timer: CPUTimer = None
 
     @property
     @abstractmethod
@@ -366,19 +368,20 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         """
         Prepare the inputs to ModelRunner and workers.
         """
-        if self.is_driver_worker:
-            if execute_model_req is None:
-                if self.do_metadata_broadcast:
-                    # This signals that there's no more requests to process for
-                    # now. All workers are running infinite loop with
-                    # broadcast_tensor_dict, and it stops the loop when the
-                    # driver broadcasts an empty input. Send an empty input to
-                    # notify all other workers to stop their execution loop.
-                    broadcast_tensor_dict({}, src=0)
-                return None
-            return self._get_driver_input_and_broadcast(execute_model_req)
-        else:
-            return self._get_worker_input_from_broadcast()
+        with self._prepare_input_timer:
+            if self.is_driver_worker:
+                if execute_model_req is None:
+                    if self.do_metadata_broadcast:
+                        # This signals that there's no more requests to process for
+                        # now. All workers are running infinite loop with
+                        # broadcast_tensor_dict, and it stops the loop when the
+                        # driver broadcasts an empty input. Send an empty input to
+                        # notify all other workers to stop their execution loop.
+                        broadcast_tensor_dict({}, src=0)
+                    return None
+                return self._get_driver_input_and_broadcast(execute_model_req)
+            else:
+                return self._get_worker_input_from_broadcast()
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

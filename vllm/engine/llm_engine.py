@@ -62,6 +62,8 @@ from vllm.utils import (Counter, Device, deprecate_kwargs,
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
 
+from vllm.profiler.metrics.metrics_store import MetricsStore
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -246,6 +248,8 @@ class LLMEngine:
             use_cached_outputs,
         )
 
+        self.metrics_store = MetricsStore.get_or_create_instance(None, vllm_config, True)       # global metrics store，记录iteration-level和request-level metrics
+
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
 
@@ -420,6 +424,15 @@ class LLMEngine:
         # Flag to set when an input fails to process and the engine should run
         # the next step without re-scheduling.
         self._skip_scheduling_next_step = False
+
+    def dump_metrics_store(self) -> None:
+        self.metrics_store.dump(True)
+        self.model_executor.dump_metrics_store()
+
+    def reset_metrics_store(self) -> None:
+        self.metrics_store.reset()
+        self.model_executor.reset_metrics_store()
+        
 
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
@@ -1406,6 +1419,9 @@ class LLMEngine:
         assert scheduler_outputs is not None
 
         if not scheduler_outputs.is_empty():
+            
+            is_prefill = scheduler_outputs.num_prefill_groups > 0
+            self.metrics_store.set_prefill(is_prefill)
 
             # Check if we have a cached last_output from the previous iteration.
             # For supporting PP this is probably the best way to pass the
@@ -1519,7 +1535,17 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
+        self._record_request_level_metrics(ctx)
         return ctx.request_outputs
+
+    def _record_request_level_metrics(
+            self,
+            ctx: SchedulerContext,
+    ) -> None:
+        # seq_group_metadata_list = ctx.seq_group_metadata_list
+        scheduler_outputs = ctx.scheduler_outputs
+        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+            scheduled_seq_group.seq_group.request_level_metrics.on_token_generated()
 
     def _abort_and_cache_schedule(
             self, request_id: str, virtual_engine: int,
